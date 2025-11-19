@@ -133,7 +133,7 @@ use bevy_ecs::{component::Component, entity::Entity, world::World};
 ///         .shader(load_embedded_asset!(world, "my_shader.wgsl"))
 ///         .bind_resources((
 ///             SampledTexture(&texture),
-///             StorageTextureReadWrite(&buffer),
+///             StorageBufferReadOnly(&buffer),
 ///         ))
 ///         .dispatch_2d(10, 20)?;
 ///

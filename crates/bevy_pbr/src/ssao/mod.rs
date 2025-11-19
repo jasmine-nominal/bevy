@@ -5,11 +5,14 @@ use bevy_core_pipeline::{
     core_3d::graph::{Core3d, Node3d},
     prepass::{DepthPrepass, NormalPrepass, ViewPrepassTextures},
 };
+use bevy_derive::Deref;
 use bevy_ecs::{
     prelude::{Component, Entity},
-    query::Has,
+    query::{Has, With},
     reflect::ReflectComponent,
     resource::Resource,
+    schedule::IntoScheduleConfigs,
+    system::{Commands, Query, Res, ResMut},
     world::{FromWorld, World},
 };
 use bevy_image::ToExtents;
@@ -28,7 +31,9 @@ use bevy_render::{
         RenderTask, RenderTaskContext,
     },
     renderer::{RenderAdapter, RenderDevice, RenderQueue},
+    texture::TextureCache,
     view::{ViewUniformOffset, ViewUniforms},
+    Render, RenderSystems,
 };
 use bevy_shader::{load_shader_library, ShaderDefVal};
 use bevy_utils::prelude::default;
@@ -135,7 +140,12 @@ impl RenderTask for ScreenSpaceAmbientOcclusion {
     }
 
     fn plugin_render_app_build(render_app: &mut SubApp) {
-        render_app.init_resource::<SsaoStaticResources>();
+        render_app
+            .init_resource::<ScreenSpaceAmbientOcclusionStaticResources>()
+            .add_systems(
+                Render,
+                prepare_ssao_textures.in_set(RenderSystems::PrepareResources),
+            );
     }
 
     fn encode_commands(
@@ -144,8 +154,9 @@ impl RenderTask for ScreenSpaceAmbientOcclusion {
         camera_entity: Entity,
         world: &World,
     ) -> Option<()> {
-        let (camera, prepass_textures, view_uniform_offset, has_temporal_jitter) =
+        let (ssao_texture, camera, prepass_textures, view_uniform_offset, has_temporal_jitter) =
             world.entity(camera_entity).get_components::<(
+                &ScreenSpaceAmbientOcclusionTexture,
                 &ExtractedCamera,
                 &ViewPrepassTextures,
                 &ViewUniformOffset,
@@ -154,9 +165,8 @@ impl RenderTask for ScreenSpaceAmbientOcclusion {
         let render_adapter = world.get_resource::<RenderAdapter>()?;
         let view_uniforms = world.get_resource::<ViewUniforms>()?.uniforms.buffer()?;
         let global_uniforms = world.get_resource::<GlobalsBuffer>()?.buffer.buffer()?;
-        let static_resources = world.get_resource::<SsaoStaticResources>()?;
-        let view_uniform_offset = view_uniform_offset.offset;
-
+        let static_resources =
+            world.get_resource::<ScreenSpaceAmbientOcclusionStaticResources>()?;
         let camera_size = camera.physical_viewport_size?.to_extents();
         let depth_format = get_depth_format(render_adapter);
         let (slice_count, samples_per_slice_side) = self.quality_level.sample_counts();
@@ -200,19 +210,6 @@ impl RenderTask for ScreenSpaceAmbientOcclusion {
             view_formats: &[],
         });
 
-        // TODO: How does prepare_mesh_view_bind_groups() get access to this texture?
-        // Might need to create this one specifically outside of RenderTask
-        let ssao_texture = ctx.texture(TextureDescriptor {
-            label: Some("ssao_texture"),
-            size: camera_size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: depth_format,
-            usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-
         let depth_differences_texture = ctx.texture(TextureDescriptor {
             label: Some("ssao_depth_differences_texture"),
             size: camera_size,
@@ -231,13 +228,13 @@ impl RenderTask for ScreenSpaceAmbientOcclusion {
             usage: BufferUsages::UNIFORM,
         });
 
-        let common_resources = (
+        let common_resources: (_, &[u32]) = (
             (
                 SamplerNonFiltering(&static_resources.point_clamp_sampler),
                 SamplerFiltering(&static_resources.linear_clamp_sampler),
                 DynamicUniformBuffer(view_uniforms),
             ),
-            [view_uniform_offset].as_slice(),
+            &[view_uniform_offset.offset],
         );
 
         ctx.compute_pass("preprocess_depth")
@@ -251,7 +248,7 @@ impl RenderTask for ScreenSpaceAmbientOcclusion {
                 StorageTextureWriteOnly(&preprocessed_depth_texture_view(3)),
                 StorageTextureWriteOnly(&preprocessed_depth_texture_view(4)),
             ))
-            .bind_resources_with_dynamic_offsets(common_resources)
+            .bind_resources_with_dynamic_offsets(common_resources.clone())
             .dispatch_2d(
                 camera_size.width.div_ceil(16),
                 camera_size.height.div_ceil(16),
@@ -276,7 +273,7 @@ impl RenderTask for ScreenSpaceAmbientOcclusion {
                 UniformBuffer(global_uniforms),
                 UniformBuffer(&thickness_buffer),
             ))
-            .bind_resources_with_dynamic_offsets(common_resources)
+            .bind_resources_with_dynamic_offsets(common_resources.clone())
             .dispatch_2d(
                 camera_size.width.div_ceil(8),
                 camera_size.height.div_ceil(8),
@@ -288,7 +285,7 @@ impl RenderTask for ScreenSpaceAmbientOcclusion {
             .bind_resources((
                 SampledTexture(&ssao_noisy_texture),
                 SampledTexture(&depth_differences_texture),
-                StorageTextureWriteOnly(&ssao_texture),
+                StorageTextureWriteOnly(&ssao_texture.0),
             ))
             .bind_resources_with_dynamic_offsets(common_resources)
             .dispatch_2d(
@@ -300,14 +297,52 @@ impl RenderTask for ScreenSpaceAmbientOcclusion {
     }
 }
 
+#[derive(Component, Deref)]
+pub struct ScreenSpaceAmbientOcclusionTexture(pub TextureView);
+
+// TODO: Remove ScreenSpaceAmbientOcclusionTexture component in render world when ScreenSpaceAmbientOcclusion removed in main world
+fn prepare_ssao_textures(
+    mut commands: Commands,
+    mut texture_cache: ResMut<TextureCache>,
+    render_device: Res<RenderDevice>,
+    render_adapter: Res<RenderAdapter>,
+    views: Query<(Entity, &ExtractedCamera), With<ScreenSpaceAmbientOcclusion>>,
+) {
+    let depth_format = get_depth_format(&render_adapter);
+
+    for (entity, camera) in &views {
+        let Some(physical_viewport_size) = camera.physical_viewport_size else {
+            continue;
+        };
+
+        let texture_descriptor = TextureDescriptor {
+            label: Some("ssao_texture"),
+            size: physical_viewport_size.to_extents(),
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: depth_format,
+            usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        };
+        let texture = texture_cache
+            .get(&render_device, texture_descriptor)
+            .default_view;
+
+        commands
+            .entity(entity)
+            .insert(ScreenSpaceAmbientOcclusionTexture(texture));
+    }
+}
+
 #[derive(Resource)]
-struct SsaoStaticResources {
+struct ScreenSpaceAmbientOcclusionStaticResources {
     hilbert_index_lut: TextureView,
     point_clamp_sampler: Sampler,
     linear_clamp_sampler: Sampler,
 }
 
-impl FromWorld for SsaoStaticResources {
+impl FromWorld for ScreenSpaceAmbientOcclusionStaticResources {
     fn from_world(world: &mut World) -> Self {
         let render_device = world.resource::<RenderDevice>();
         let render_queue = world.resource::<RenderQueue>();
